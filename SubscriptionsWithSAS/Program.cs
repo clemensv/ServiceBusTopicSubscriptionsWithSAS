@@ -11,81 +11,106 @@
 
 namespace Microsoft.Samples.SubscriptionsWithSAS
 {
-    using Microsoft.ServiceBus;
-    using Microsoft.ServiceBus.Messaging;
+    using Microsoft.Azure.ServiceBus;
+    using Microsoft.Azure.ServiceBus.Management;
+    using Microsoft.Azure.ServiceBus.Primitives;
     using System;
     using System.Collections.Generic;
     using System.Linq;
+    using System.Text;
+    using System.Threading;
+    using System.Threading.Tasks;
 
     class Program
     {
-        #region Fields
-
         internal static string nsConnectionString;
         internal const string topicPath = "contosoT";
         internal const string subscriptionName = "sasSubscription";
         internal static SharedAccessAuthorizationRule contosoTListenRule;
 
-        #endregion
-
         static void Main(string[] args)
+        {
+            MainAsync(args).GetAwaiter().GetResult();
+        }
+
+        static async Task MainAsync(string[] args)
         {
             // The connection string for the RootManageSharedAccessKey can be accessed from the Azure portal 
             // by selecting the SB namespace and clicking on "Connection Information"
             Console.Write("Enter your connection string for the RootManageSharedAccessKey for your Service Bus namespace: ");
             nsConnectionString = Console.ReadLine();
 
+            var cxn = new ServiceBusConnectionStringBuilder(nsConnectionString);
             ///////////////////////////////////////////////////////////////////////////////////////
             // Create a topic with a SAS Listen rule and an associated subscription
             ///////////////////////////////////////////////////////////////////////////////////////
-            NamespaceManager nm = NamespaceManager.CreateFromConnectionString(nsConnectionString);
+            ManagementClient nm = new ManagementClient(cxn);
             contosoTListenRule = new SharedAccessAuthorizationRule("contosoTListenKey",
-                SharedAccessAuthorizationRule.GenerateRandomKey(),
                 new[] { AccessRights.Listen });
+            
             TopicDescription td = new TopicDescription(topicPath);
-            td.Authorization.Add(contosoTListenRule);
-            nm.CreateTopic(td);
-            nm.CreateSubscription(topicPath, subscriptionName);
-
+            td.AuthorizationRules.Add(contosoTListenRule);
+            if ((await nm.TopicExistsAsync(topicPath)))
+            {
+                await nm.DeleteTopicAsync(topicPath);
+            }
+            await nm.CreateTopicAsync(td);
+            await nm.CreateSubscriptionAsync(topicPath, subscriptionName);
+        
             ///////////////////////////////////////////////////////////////////////////////////////
             // Send a message to the topic
             // Note that this uses the connection string for RootManageSharedAccessKey 
             // configured on the namespace root
             ///////////////////////////////////////////////////////////////////////////////////////
-            MessagingFactory sendMF = MessagingFactory.CreateFromConnectionString(nsConnectionString);
-            TopicClient tc = sendMF.CreateTopicClient(topicPath);
-            BrokeredMessage sentMessage = CreateHelloMessage();
-            tc.Send(sentMessage);
-            Console.WriteLine("Sent Hello message to topic: ID={0}, Body={1}.", sentMessage.MessageId, sentMessage.GetBody<string>());
+
+            TopicClient tc = new TopicClient(cxn.GetNamespaceConnectionString(), topicPath, RetryPolicy.Default);
+            Message sentMessage = CreateHelloMessage();
+            await tc.SendAsync(sentMessage);
+            Console.WriteLine("Sent Hello message to topic: ID={0}, Body={1}.", sentMessage.MessageId, Encoding.UTF8.GetString(sentMessage.Body));
 
             ///////////////////////////////////////////////////////////////////////////////////////
             // Generate a SAS token scoped to a subscription using the SAS rule with 
             // a Listen right configured on the Topic & TTL of 1 day
             ///////////////////////////////////////////////////////////////////////////////////////
             ServiceBusConnectionStringBuilder csBuilder = new ServiceBusConnectionStringBuilder(nsConnectionString);
-            IEnumerable<Uri> endpoints = csBuilder.Endpoints;
-            string subscriptionUri = endpoints.First<Uri>().ToString() + topicPath + "/subscriptions/" + subscriptionName;
-            var tp = TokenProvider.CreateSharedAccessSignatureTokenProvider(contosoTListenRule.KeyName, contosoTListenRule.PrimaryKey);
-            var subscriptionToken = tp.GetWebTokenAsync(subscriptionUri, string.Empty, false, TimeSpan.FromMinutes(180)).GetAwaiter().GetResult();
+            string subscriptionUri = new Uri(new Uri(csBuilder.Endpoint), topicPath + "/subscriptions/" + subscriptionName).ToString();
 
+            // This is how you acquire a token in an STS to pass it out to a client.
+            var tp = TokenProvider.CreateSharedAccessSignatureTokenProvider(contosoTListenRule.KeyName, contosoTListenRule.PrimaryKey);
+            var subscriptionToken = await tp.GetTokenAsync(subscriptionUri, TimeSpan.FromMinutes(180));
+
+            Console.WriteLine($"Acquired token: {subscriptionToken.TokenValue}");
 
             ///////////////////////////////////////////////////////////////////////////////////////
             // Use the SAS token scoped to a subscription to receive the messages
             ///////////////////////////////////////////////////////////////////////////////////////
-            MessagingFactory listenMF = MessagingFactory.Create(endpoints, TokenProvider.CreateSharedAccessSignatureTokenProvider(subscriptionToken));
-            SubscriptionClient sc = listenMF.CreateSubscriptionClient(topicPath, subscriptionName);
-            BrokeredMessage receivedMessage = sc.Receive(TimeSpan.FromSeconds(10));
-            Console.WriteLine("Received message from subscription: ID = {0}, Body = {1}.", receivedMessage.MessageId, receivedMessage.GetBody<string>());
+
+            var are = new AutoResetEvent(false);
+            SubscriptionClient sc = new SubscriptionClient(csBuilder.Endpoint, topicPath, subscriptionName, TokenProvider.CreateSharedAccessSignatureTokenProvider(subscriptionToken.TokenValue));
+            sc.RegisterMessageHandler(async (m, c) =>
+               {
+                   Console.WriteLine("Received message from subscription: ID = {0}, Body = {1}.", m.MessageId, Encoding.UTF8.GetString(m.Body));
+                   await sc.CompleteAsync(m.SystemProperties.LockToken);
+                   are.Set();
+               }, 
+               new MessageHandlerOptions(async (e) => 
+               {
+                   Console.WriteLine($"Exception: {e.Exception.ToString()}");
+               }){ AutoComplete = false });
+            
+
+            are.WaitOne();
+            await sc.CloseAsync();
 
             ///////////////////////////////////////////////////////////////////////////////////////
             // Clean-up
             ///////////////////////////////////////////////////////////////////////////////////////
-            nm.DeleteTopic(topicPath);
+            await nm.DeleteTopicAsync(topicPath);
         }
 
-        private static BrokeredMessage CreateHelloMessage()
+        private static Message CreateHelloMessage()
         {
-            BrokeredMessage helloMessage = new BrokeredMessage("Hello, Service Bus!");
+            Message helloMessage = new Message(Encoding.UTF8.GetBytes("Hello, Service Bus!"));
             helloMessage.MessageId = "SAS-Sample-Message";
             return helloMessage;
         }
